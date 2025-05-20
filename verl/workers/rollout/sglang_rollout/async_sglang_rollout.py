@@ -132,6 +132,21 @@ class AsyncSGLangRollout(BaseRollout):
             tools_config_file = config.multi_turn.tool_config_path
             tools_config = OmegaConf.load(tools_config_file)
             tool_list = initialize_tools(tools_config)
+        elif config.multi_turn.tool_list is not None:
+            import importlib.util
+            import sys
+
+            module_name, class_name = config.multi_turn.tool_list.rsplit(".", 1)
+            if module_name not in sys.modules:
+                spec = importlib.util.find_spec(module_name)
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+            else:
+                module = sys.modules[module_name]
+
+            tool_functions = getattr(module, class_name)
+            tool_list = [BaseTool.from_callable(func) for func in tool_functions]
 
         if tool_list is not None:
             self._tool_schemas = [tool.get_openai_tool_schema().model_dump() for tool in tool_list]

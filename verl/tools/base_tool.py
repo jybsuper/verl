@@ -12,7 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Optional, Tuple
+import json
+import logging
+import os
+import types
+from json import JSONDecodeError
+from typing import Any, Optional, Tuple, Callable
 from uuid import uuid4
 
 from .schemas import OpenAIFunctionToolSchema
@@ -84,3 +89,37 @@ class BaseTool:
             instance_id: The instance id of the tool.
         """
         pass
+
+    @staticmethod
+    def from_callable(tool: Callable) -> "BaseTool":
+        """Create a BaseTool instance from a callable python function."""
+        from transformers.utils import get_json_schema
+
+        instance = BaseTool({}, tool_schema=OpenAIFunctionToolSchema.parse_obj(get_json_schema(tool)))
+        tool_name = instance.tool_schema.function.name
+
+        logger = logging.getLogger(tool_name)
+        logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+        async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> Tuple[str, float, dict]:
+            try:
+                res = tool(**parameters)
+                if isinstance(res, dict | list):
+                    res = json.dumps(res)
+                else:
+                    res = str(res)
+                return res, 0.0, {}
+            except JSONDecodeError as e:
+                logger.error(f"JSONDecodeError in {tool_name}: {str(e)}. Tool Response: {res}")
+                return json.dumps({"error": f"Failed to invoke {tool_name}"}), 0.0, {}
+            except Exception as e:
+                logger.error(f"Error in {tool_name}: {str(e)}. Parameters: {parameters}")
+                return json.dumps({"error": f"Failed to invoke {tool_name}"}), 0.0, {}
+
+        async def release(self, instance_id: str, **kwargs) -> None:
+            if hasattr(tool, "__del__"):
+                tool.__del__()
+    
+        instance.execute = types.MethodType(execute, instance)
+        instance.release = types.MethodType(release, instance)
+        return instance
