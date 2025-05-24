@@ -201,7 +201,7 @@ class AsyncSGLangRollout(BaseRollout):
                 load_format=load_format,
                 dist_init_addr=dist_init_addr,
                 nnodes=nnodes,
-                skip_tokenizer_init=self.fast_tokenization_enabled,
+                skip_tokenizer_init=self.tokenization_mode == "fast",
                 trust_remote_code=trust_remote_code,
                 # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
                 # when random.seed is being set during training
@@ -496,7 +496,7 @@ class AsyncSGLangRollout(BaseRollout):
             elif _req.state == AsyncRolloutRequestStateEnum.RUNNING:
                 output = await self._handle_engine_call(_req, do_sample, is_validate, **kwargs)
                 # No EOS token at the end of the decoded output
-                content = self.tokenizer.decode(output["output_ids"], skip_special_tokens=True) if self.fast_tokenization_enabled else output["text"]
+                content = self.tokenizer.decode(output["output_ids"], skip_special_tokens=True) if self.tokenization_mode == "fast" else output["text"]
                 # EON token included in output token ids unless the generation stopped because it reached the max allowed length
                 content_ids = output.get("output_ids")
                 finish_reason_type = FinishReasonTypeEnum.from_str(output["meta_info"]["finish_reason"]["type"])
@@ -784,6 +784,7 @@ class AsyncSGLangRollout(BaseRollout):
                     reward_scores={},
                     max_response_len=self.config.response_length,
                     max_model_len=min(self.config.max_model_len, self.config.prompt_length + self.config.response_length),
+                    tokenization_mode=self.tokenization_mode,
                 )
 
                 error_message = f"Request {req.request_id} has mismatched lengths: input_ids={len(req.input_ids)}, attention_mask={len(req.attention_mask)}, position_ids={len(req.position_ids)}, loss_mask={len(req.loss_mask)}"
