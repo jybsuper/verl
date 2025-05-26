@@ -160,8 +160,8 @@ class AsyncSGLangRollout(BaseRollout):
         if self.config.multi_turn.max_turns is None:
             self.config.multi_turn.max_turns = self.config.max_model_len // 3
 
-        assert self.config.multi_turn.fast_tokenization in {"enable", "disable", "sanity_check"}, f"fast_tokenization should be one of [enable, disable, sanity_check], but got {self.config.multi_turn.fast_tokenization}"
-        self.fast_tokenization_enabled = self.config.multi_turn.fast_tokenization == "enable"
+        assert self.config.multi_turn.tokenization_mode in {"fast", "full", "sanity_check"}, f"tokenization_mode should be one of [fast, full, sanity_check], but got {self.config.multi_turn.tokenization_mode}"
+        self.tokenization_mode = self.config.multi_turn.tokenization_mode
 
     def _init_inference_engine(self, trust_remote_code, actor_module, port):
         # initialize the inference engine

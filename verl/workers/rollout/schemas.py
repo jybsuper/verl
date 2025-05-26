@@ -71,9 +71,7 @@ class AsyncRolloutRequest(BaseModel):
     request_id: str
     state: AsyncRolloutRequestStateEnum
     messages: List[Message]
-    messages_dumps: List[Dict[str, Any]]
     tool_schemas: Optional[List[OpenAIFunctionToolSchema]] = None
-    tools: Optional[list[dict]] = None
     tools_kwargs: Dict[str, Any] = {}
     input_ids: List[int]
     prompt_ids: List[int]
@@ -108,60 +106,85 @@ class AsyncRolloutRequest(BaseModel):
             raise ValueError("tokenizer is required for AsyncRolloutRequest initialization")
 
         values["messages"] = [Message.model_validate(msg) for msg in messages]
-        values["messages_dumps"] = [msg.model_dump() for msg in values["messages"]]
 
-        if tool_schemas := values.get("tool_schemas"):
-            tools = values["tools"] = [tool.model_dump() for tool in tool_schemas]
-            tokens_without_prompt = tokenizer.apply_chat_template(messages, tools=tools, add_generation_prompt=False, tokenize=True)
-            tokenization_dict_with_prompt = tokenizer.apply_chat_template(messages, tools=tools, add_generation_prompt=True, tokenize=True, return_dict=True)
-            values["input_ids"] = values["prompt_ids"] = tokenization_dict_with_prompt["input_ids"]
-            values["attention_mask"] = values["prompt_attention_mask"] = tokenization_dict_with_prompt["attention_mask"]
+        tools = [tool.model_dump() for tool in tool_schemas] if (tool_schemas := values.get("tool_schemas", [])) else None
+        tokens_without_prompt = tokenizer.apply_chat_template(messages, tools=tools, add_generation_prompt=False, tokenize=True)
+        if not values.get("input_ids") or not values.get("attention_mask"):
+            tokenization_dict_with_prompt = tokenizer.apply_chat_template(messages, tools=[tool.model_dump() for tool in tool_schemas], add_generation_prompt=True, tokenize=True, return_dict=True)
+            values["input_ids"], values["attention_mask"] = tokenization_dict_with_prompt["input_ids"], tokenization_dict_with_prompt["attention_mask"]
             if len(values["input_ids"]) > max_prompt_len:
                 # Only log the warning to avoid truncating in the middle of generation prompt. Consider raising an error for this case in the future.
                 logger.warning(f"Prompt {values['batch_data_id']} length {len(values['input_ids'])} greater than max_prompt_len {max_prompt_len} after applied chat template with tools.")
-        elif not values.get("input_ids") or not values.get("attention_mask"):
-            raise ValueError("input_ids and attention_mask is required for requests without tools")
-        else:
-            tokens_without_prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=False, tokenize=True)
-            values["prompt_ids"], values["prompt_attention_mask"] = values["input_ids"], values["attention_mask"]
 
+        values["prompt_ids"], values["prompt_attention_mask"] = values["input_ids"], values["attention_mask"]
         values["position_ids"] = values["prompt_position_ids"] = compute_position_id_with_mask(torch.tensor(values["attention_mask"])).tolist()
         values["loss_mask"] = values["prompt_loss_mask"] = [0] * len(values["input_ids"])
         values["generation_prompt_ids"] = values["input_ids"][len(tokens_without_prompt) :]
         return values
 
     def _update_input_ids(self, new_input_ids: List[int], attention_mask: bool, loss_mask: bool, full_tokens: bool = False) -> None:
+        """
+        Update the input_ids, attention_mask, position_ids, and loss_mask of the request.
+        When full_tokens is True, it replaces the input_ids with new_input_ids and updates the attention_mask, position_ids, and loss_mask accordingly.
+        When full_tokens is False, it appends new_input_ids to the input_ids and updates the attention_mask, position_ids, and loss_mask accordingly.
+        """
         message_len_delta = (len(new_input_ids) - len(self.input_ids)) if full_tokens else len(new_input_ids)
         self.input_ids = new_input_ids if full_tokens else (self.input_ids + new_input_ids)
         attention_mask = [int(attention_mask)] * message_len_delta
         self.attention_mask += attention_mask
-        _delta_position_ids = compute_position_id_with_mask(torch.tensor(attention_mask)).tolist()
-        last_position_id = self.position_ids[-1]
-        _position_ids = [pos_id + last_position_id for pos_id in _delta_position_ids]
         self.loss_mask += [int(loss_mask)] * message_len_delta
-        self.position_ids += _position_ids
+        self.position_ids += (compute_position_id_with_mask(torch.tensor(attention_mask)) + (self.position_ids[-1] + 1)).tolist()
 
         assert len(self.input_ids) == len(self.attention_mask) == len(self.position_ids) == len(self.loss_mask), f"""Request {self.request_id} has different length of {len(self.input_ids)=}, 
             {len(self.attention_mask)=}, {len(self.position_ids)=}, {len(self.loss_mask)=}"""
 
-    def _append_messages(self, messages: list[Message]) -> None:
-        self.messages.extend(messages)
-        self.messages_dumps.extend([msg.model_dump() for msg in messages])
+    def _fast_tokenize(self, tokenizer: PreTrainedTokenizer, num_messages: int, add_generation_prompt: bool, delta_tokens: Optional[List[int]] = None) -> list[int]:
+        """Fast tokenization tokenize the new messages only and append the tokens to the existing input_ids."""
 
-    def _tokenize_all_messages(self, tokenizer: PreTrainedTokenizer, delta_input_ids_to_check: Optional[list[int]], add_generation_prompt: bool = False) -> None:
-        full_input_ids = tokenizer.apply_chat_template(self.messages_dumps, tools=self.tools, add_generation_prompt=add_generation_prompt, tokenize=True)
-        if self.tokenization_mode == "sanity_check" and delta_input_ids_to_check is not None:
-            assert full_input_ids == self.input_ids + delta_input_ids_to_check, (
-                f"Sanity check failed.\nFull tokenization result:\n{tokenizer.decode(full_input_ids, skip_special_tokens=False)}\nFast tokenization result:\n{tokenizer.decode(self.input_ids + delta_input_ids_to_check, skip_special_tokens=False)}"
-            )
-        self._update_input_ids(full_input_ids, attention_mask=True, loss_mask=False, full_tokens=True)
+        # Handles cases where tool calls are incorrectly embedded, such as: I'll call the tool: <tool_call>{"name": ...}</tool_call>. Does this make sense?
+        # The code below restructures the text and tool calls parsed by the SGLang tool parser using the chat template.
+        # The outcome depends on the SGLang tool parser; for instance, with Qwen, any text after the first tool call is ignored.
+        # TODO: Reconsider this approach for RL scenarios: 1. Try to parse as much valid response as possible; 2. Surface the error to the model for learning.
+        if num_messages and (not delta_tokens or self.messages[-1].tool_calls):
+            tools = [tool.model_dump() for tool in self.tool_schemas] if self.tool_schemas else None
+            content_start_pos = len(tokenizer.apply_chat_template([msg.model_dump() for msg in self.messages[:-num_messages]], tools=tools, add_generation_prompt=add_generation_prompt, tokenize=False))
+            content = tokenizer.apply_chat_template([msg.model_dump() for msg in self.messages], tools=tools, add_generation_prompt=False, tokenize=False)[content_start_pos:]
+            delta_tokens = tokenizer.encode(content, add_special_tokens=False)
+        return delta_tokens
 
-    def get_prompt_ids(self, tokenizer: PreTrainedTokenizer) -> list[int]:
+    def _full_tokenize(self, tokenizer: PreTrainedTokenizer, add_generation_prompt: bool) -> list[int]:
+        """Full tokenization tokenizes the entire message history and returns the full tokenization result."""
+        tools = [tool.model_dump() for tool in self.tool_schemas] if self.tool_schemas else None
+        return tokenizer.apply_chat_template([msg.model_dump() for msg in self.messages], tools=tools, add_generation_prompt=add_generation_prompt, tokenize=True)
+
+    def _tokenize_messages(self, tokenizer: PreTrainedTokenizer, num_messages: int, loss_mask: bool, add_generation_prompt: bool, delta_tokens: Optional[List[int]] = None) -> None:
+        """
+        Tokenizes messages and updates `input_ids`, `attention_mask`, `position_ids`, and `loss_mask` based on the selected tokenization mode.
+
+        :param num_messages: (Only used in "fast" mode) Specifies the number of most recent messages to tokenize.
+        :param add_generation_prompt: (Only used in "full" mode) Indicates whether to include a generation prompt in the tokenized output.
+        :param delta_tokens: (Only used in "fast" mode) Tokens to append to `input_ids`. If None, the method tokenizes the last `num_messages` messages.
+        """
+        match self.tokenization_mode:
+            case "fast":
+                # Only when tokenizing assistant messages do we set loss_mask to True and exclude the generation prompt from token ids.
+                # Therefore, only when loss_mask==True, we include the generation prompt in the calculation of the start position of new message tokens
+                self._update_input_ids(self._fast_tokenize(tokenizer, num_messages, loss_mask, delta_tokens), attention_mask=True, loss_mask=loss_mask)
+            case "full":
+                self._update_input_ids(self._full_tokenize(tokenizer, add_generation_prompt), attention_mask=True, loss_mask=loss_mask, full_tokens=True)
+            case "sanity_check":
+                full_tokens = self._full_tokenize(tokenizer, add_generation_prompt)
+                delta_tokens = self._fast_tokenize(tokenizer, num_messages, loss_mask, delta_tokens)
+                assert full_tokens == self.input_ids + delta_tokens, f"Sanity check failed.\nFull tokenization result:\n{tokenizer.decode(full_tokens, skip_special_tokens=False)}\nFast tokenization result:\n{tokenizer.decode(self.input_ids + delta_tokens, skip_special_tokens=False)}"
+                self._update_input_ids(full_tokens, attention_mask=True, loss_mask=loss_mask, full_tokens=True)
+            case _:
+                raise ValueError(f"Unsupported tokenization mode: {self.tokenization_mode}. Supported modes are 'fast', 'full', and 'sanity_check'.")
+
+    def get_generation_prompt_ids(self, tokenizer: PreTrainedTokenizer) -> list[int]:
         generation_prompt_ids = [] if self.input_ids[-len(self.generation_prompt_ids) :] == self.generation_prompt_ids else self.generation_prompt_ids
-        if self.tokenization_mode == "fast":
-            self._update_input_ids(generation_prompt_ids, attention_mask=True, loss_mask=False)
-        else:
-            self._tokenize_all_messages(tokenizer, generation_prompt_ids, add_generation_prompt=True)
+        if not generation_prompt_ids:
+            return self.input_ids
+        self._tokenize_messages(tokenizer, num_messages=0, loss_mask=False, add_generation_prompt=True, delta_tokens=generation_prompt_ids)
         return self.input_ids
 
     def add_assistant_message(
@@ -171,40 +194,14 @@ class AsyncRolloutRequest(BaseModel):
         content_ids: Optional[List[int]] = None,
         tool_calls: Optional[List[OpenAIFunctionToolCall]] = None,
     ) -> None:
-        self._append_messages([Message(role="assistant", content=content, tool_calls=tool_calls)])
-
-        if self.tokenization_mode != "full":
-            if tool_calls or not content_ids:
-                # Handles cases where tool calls are incorrectly embedded, such as: I'll call the tool: <tool_call>{"name": ...}</tool_call>. Does this make sense?
-                # The code below restructures the text and tool calls parsed by the SGLang tool parser using the chat template.
-                # The outcome depends on the SGLang tool parser; for instance, with Qwen, any text after the first tool call is ignored.
-                # TODO: Reconsider this approach for RL scenarios: 1. Try to parse as much valid response as possible; 2. Surface the error to the model for learning.
-                content_start_pos = len(tokenizer.apply_chat_template(self.messages_dumps[:-1], tools=self.tools, add_generation_prompt=True, tokenize=False))
-                content = tokenizer.apply_chat_template(self.messages_dumps, tools=self.tools, add_generation_prompt=False, tokenize=False)[content_start_pos:]
-                content_ids = tokenizer.encode(content, add_special_tokens=False)
-
-            if self.tokenization_mode == "fast":
-                self._update_input_ids(content_ids, attention_mask=True, loss_mask=True)
-                return
-
-        self._tokenize_all_messages(tokenizer, content_ids)
+        self.messages.append(Message(role="assistant", content=content, tool_calls=tool_calls))
+        self._tokenize_messages(tokenizer, num_messages=1, loss_mask=True, add_generation_prompt=False, delta_tokens=content_ids)
 
     def add_tool_response_messages(self, tokenizer: PreTrainedTokenizer, contents: list[str]) -> None:
         if not contents:
             return
-
-        self._append_messages([Message(role="tool", content=content) for content in contents])
-        response_token_ids = None
-        if self.tokenization_mode != "full":
-            response_start_pos = len(tokenizer.apply_chat_template(self.messages_dumps[: -len(contents)], tools=self.tools, add_generation_prompt=False, tokenize=False))
-            response_tokens = tokenizer.apply_chat_template(self.messages_dumps, tools=self.tools, add_generation_prompt=False, tokenize=False)[response_start_pos:]
-            response_token_ids = tokenizer.encode(response_tokens, add_special_tokens=False)
-
-            if self.tokenization_mode == "fast":
-                self._update_input_ids(response_token_ids, attention_mask=True, loss_mask=False)
-                return
-
-        self._tokenize_all_messages(tokenizer, response_token_ids)
+        self.messages.extend([Message(role="tool", content=content) for content in contents])
+        self._tokenize_messages(tokenizer, num_messages=len(contents), loss_mask=False, add_generation_prompt=False)
 
     def update_metrics(self, metrics: Any, tool_id: str) -> None:
         """
