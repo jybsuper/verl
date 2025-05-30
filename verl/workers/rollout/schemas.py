@@ -15,7 +15,7 @@
 import logging
 import os
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from pydantic import BaseModel, model_validator
@@ -26,8 +26,6 @@ from verl.utils.model import compute_position_id_with_mask
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-BASE_CHAT_HISTORY = [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "I am a user."}]
 
 
 class FinishReasonTypeEnum(str, Enum):
@@ -93,10 +91,8 @@ class AsyncRolloutRequest(BaseModel):
     max_model_len: int = 32768
     metrics: Dict[str, List[Any]] = {}
 
-    tokenization_mode: Literal["fast", "full", "sanity_check"]
+    sanity_check_tokenization: bool
     generation_prompt_ids: List[int]
-    base_conv_wo_gen_prompt_end_pos: int
-    base_conv_with_gen_prompt_end_pos: int
 
     @model_validator(mode="before")
     @classmethod
@@ -123,8 +119,6 @@ class AsyncRolloutRequest(BaseModel):
         values["position_ids"] = values["prompt_position_ids"] = compute_position_id_with_mask(torch.tensor(values["attention_mask"])).tolist()
         values["loss_mask"] = values["prompt_loss_mask"] = [0] * len(values["input_ids"])
         values["generation_prompt_ids"] = values["input_ids"][len(tokens_without_prompt) :]
-        values["base_conv_wo_gen_prompt_end_pos"] = len(tokenizer.apply_chat_template(BASE_CHAT_HISTORY, tools=tools, add_generation_prompt=False, tokenize=False))
-        values["base_conv_with_gen_prompt_end_pos"] = len(tokenizer.apply_chat_template(BASE_CHAT_HISTORY, tools=tools, add_generation_prompt=True, tokenize=False))
         return values
 
     def _update_input_ids(self, new_input_ids: List[int], attention_mask: bool, loss_mask: bool) -> None:
@@ -142,31 +136,30 @@ class AsyncRolloutRequest(BaseModel):
 
     def get_generation_prompt_ids(self, tokenizer: PreTrainedTokenizer) -> list[int]:
         generation_prompt_ids = [] if self.input_ids[-len(self.generation_prompt_ids) :] == self.generation_prompt_ids else self.generation_prompt_ids
-        if not generation_prompt_ids:
-            return self.input_ids
-        self._update_input_ids(generation_prompt_ids, attention_mask=True, loss_mask=False)
-        return tokenizer.apply_chat_template([msg.model_dump() for msg in self.messages], tools=([tool.model_dump() for tool in self.tool_schemas] if self.tool_schemas else None), add_generation_prompt=True, tokenize=True)
+        if generation_prompt_ids:
+            self._update_input_ids(generation_prompt_ids, attention_mask=True, loss_mask=False)
+        return self.input_ids
 
     def add_assistant_message(
         self,
         tokenizer: PreTrainedTokenizer,
         content: str,
-        content_ids: Optional[List[int]] = None,
         tool_calls: Optional[List[OpenAIFunctionToolCall]] = None,
     ) -> None:
         self.messages.append(Message(role="assistant", content=content, tool_calls=tool_calls))
-        if not content_ids:
-            content = tokenizer.apply_chat_template([*BASE_CHAT_HISTORY, self.messages[-1]], tools=([tool.model_dump() for tool in self.tool_schemas] if self.tool_schemas else None), add_generation_prompt=False, tokenize=False)
-            content_ids = tokenizer.encode(content[self.base_conv_with_gen_prompt_end_pos :], add_special_tokens=False)
-        self._update_input_ids(content_ids, attention_mask=True, loss_mask=True)
+        tools = [tool.model_dump() for tool in self.tool_schemas] if self.tool_schemas else None
+        content_start_pos = len(tokenizer.apply_chat_template([msg.model_dump() for msg in self.messages[:-1]], tools=tools, add_generation_prompt=True, tokenize=False))
+        content = tokenizer.apply_chat_template([msg.model_dump() for msg in self.messages], tools=tools, add_generation_prompt=False, tokenize=False)[content_start_pos:]
+        self._update_input_ids(tokenizer.encode(content, add_special_tokens=False), attention_mask=True, loss_mask=True)
 
     def add_tool_response_messages(self, tokenizer: PreTrainedTokenizer, contents: list[str]) -> None:
         if not contents:
             return
         self.messages.extend([Message(role="tool", content=content) for content in contents])
-        content = tokenizer.apply_chat_template([*BASE_CHAT_HISTORY, *self.messages[-len(contents) :]], tools=([tool.model_dump() for tool in self.tool_schemas] if self.tool_schemas else None), add_generation_prompt=False, tokenize=False)
-        content_ids = tokenizer.encode(content[self.base_conv_wo_gen_prompt_end_pos :], add_special_tokens=False)
-        self._update_input_ids(content_ids, attention_mask=True, loss_mask=False)
+        tools = [tool.model_dump() for tool in self.tool_schemas] if self.tool_schemas else None
+        content_start_pos = len(tokenizer.apply_chat_template([msg.model_dump() for msg in self.messages[: -len(contents)]], tools=tools, add_generation_prompt=False, tokenize=False))
+        content = tokenizer.apply_chat_template([msg.model_dump() for msg in self.messages], tools=tools, add_generation_prompt=False, tokenize=False)[content_start_pos:]
+        self._update_input_ids(tokenizer.encode(content, add_special_tokens=False), attention_mask=True, loss_mask=False)
 
     def update_metrics(self, metrics: Any, tool_id: str) -> None:
         """
@@ -184,7 +177,7 @@ class AsyncRolloutRequest(BaseModel):
     ) -> None:
         self.state = AsyncRolloutRequestStateEnum.COMPLETED
         self.reward_scores = reward_scores
-        if self.tokenization_mode == "sanity_check":
+        if self.sanity_check_tokenization:
             full_tokens = tokenizer.apply_chat_template([msg.model_dump() for msg in self.messages], tools=([tool.model_dump() for tool in self.tool_schemas] if self.tool_schemas else None), add_generation_prompt=False, tokenize=True)
             assert self.input_ids == full_tokens, f"Sanity check failed.\nFull tokenization result:\n{tokenizer.decode(full_tokens, skip_special_tokens=False)}\nCurrent input_ids:\n{tokenizer.decode(self.input_ids, skip_special_tokens=False)}"
 

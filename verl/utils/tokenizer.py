@@ -17,6 +17,10 @@ import warnings
 
 __all__ = ["hf_tokenizer", "hf_processor"]
 
+from transformers import PreTrainedTokenizer
+
+from verl.utils.chat_templates import chat_template_replacement, hash_chat_template
+
 
 def set_pad_token_id(tokenizer):
     """Set pad_token_id to eos_token_id if it is None.
@@ -33,12 +37,21 @@ def set_pad_token_id(tokenizer):
         warnings.warn(f"tokenizer.pad_token is None. Now set to {tokenizer.eos_token}", stacklevel=1)
 
 
-def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kwargs):
+def _replace_chat_template(tokenizer: PreTrainedTokenizer) -> None:
+    """Replace training chat template for tokenizer"""
+    new_template = chat_template_replacement.get(hash_chat_template(tokenizer.chat_template)) if hasattr(tokenizer, "chat_template") else None
+    if new_template:
+        tokenizer.chat_template = new_template
+        warnings.warn(f"Chat template replaced for tokenizer: {tokenizer.name_or_path}", stacklevel=1)
+
+
+def hf_tokenizer(name_or_path, replace_chat_template: bool = False, correct_pad_token=True, correct_gemma2=True, **kwargs):
     """Create a huggingface pretrained tokenizer which correctness handles eos and pad tokens.
 
     Args:
 
-        name (str): The name of the tokenizer.
+        name_or_path (str): The name of the tokenizer.
+        replace_chat_template (bool): If replace multiturn chat template.
         correct_pad_token (bool): Whether to correct the pad token id.
         correct_gemma2 (bool): Whether to correct the gemma2 tokenizer.
 
@@ -58,6 +71,8 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
     tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
     if correct_pad_token:
         set_pad_token_id(tokenizer)
+    if replace_chat_template:
+        _replace_chat_template(tokenizer)
     return tokenizer
 
 

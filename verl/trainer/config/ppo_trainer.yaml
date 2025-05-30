@@ -141,12 +141,12 @@ actor_rollout_ref:
       do_sample: False # default eager for validation
     multi_turn:
       enable: False  # should set rollout.name to sglang_async if True
+      replace_chat_template: ${actor_rollout_ref.multi_turn.enable}  # whether to replace chat template for models with chat templates not designed for multi-turn training
       max_turns: null  # null for no limit (default max_length // 3)
       tool_config_path: null  # null for no tool
-      # choose from: fast, sanity_check
-      # fast: only tokenizes the new messages in each turn
-      # sanity_check: Check if fast tokenization produces consistent results. Use this for new chat templates only; not recommended for actual training.
-      tokenization_mode: fast
+      # By default, multiturn rollout concatenates each turn's message using chat template to create the full prompt.
+      # This approach may not work with some chat templates. The sanity check verifies that concatenating the conversation and tokenizing the entire conversation produces the same prompt.
+      sanity_check_tokenization: True
 
 critic:
   rollout_n: ${actor_rollout_ref.rollout.n}

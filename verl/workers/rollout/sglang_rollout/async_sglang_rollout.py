@@ -160,9 +160,6 @@ class AsyncSGLangRollout(BaseRollout):
         if self.config.multi_turn.max_turns is None:
             self.config.multi_turn.max_turns = self.config.max_model_len // 3
 
-        assert self.config.multi_turn.tokenization_mode in {"fast", "sanity_check"}, f"tokenization_mode should be one of [fast, sanity_check], but got {self.config.multi_turn.tokenization_mode}"
-        self.tokenization_mode = self.config.multi_turn.tokenization_mode
-
     def _init_inference_engine(self, trust_remote_code, actor_module, port):
         # initialize the inference engine
         nnodes = -(-self._tp_size // len(self.visible_devices_set))
@@ -200,7 +197,7 @@ class AsyncSGLangRollout(BaseRollout):
                 load_format=load_format,
                 dist_init_addr=dist_init_addr,
                 nnodes=nnodes,
-                skip_tokenizer_init=self.tokenization_mode == "fast",
+                skip_tokenizer_init=True,
                 trust_remote_code=trust_remote_code,
                 # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
                 # when random.seed is being set during training
@@ -494,14 +491,12 @@ class AsyncSGLangRollout(BaseRollout):
                     raise ValueError(f"Unexpected tool calling last message state: {_req.messages[-1]}")
             elif _req.state == AsyncRolloutRequestStateEnum.RUNNING:
                 output = await self._handle_engine_call(_req, do_sample, is_validate, **kwargs)
-                # No EOS token at the end of the decoded output
-                content = self.tokenizer.decode(output["output_ids"], skip_special_tokens=True) if self.tokenization_mode == "fast" else output["text"]
-                # EON token included in output token ids unless the generation stopped because it reached the max allowed length
-                content_ids = output.get("output_ids")
+                # Eliminate the EOS token from the end of the decoded output
+                content = self.tokenizer.decode(output["output_ids"], skip_special_tokens=True)
                 finish_reason_type = FinishReasonTypeEnum.from_str(output["meta_info"]["finish_reason"]["type"])
                 current_turns += 1
                 if finish_reason_type == FinishReasonTypeEnum.LENGTH:
-                    _req.add_assistant_message(self.tokenizer, content, content_ids)
+                    _req.add_assistant_message(self.tokenizer, content)
                     break
                 else:
                     if self._function_call_parser and self._function_call_parser.has_tool_call(content):
@@ -530,12 +525,12 @@ class AsyncSGLangRollout(BaseRollout):
                         if len(parsed_tool_calls) > 0:
                             _req.add_assistant_message(self.tokenizer, normed_content, tool_calls=parsed_tool_calls)
                         else:
-                            _req.add_assistant_message(self.tokenizer, content, content_ids)
+                            _req.add_assistant_message(self.tokenizer, content)
                             finish_reason_type = FinishReasonTypeEnum.STOP
                             _req.state = AsyncRolloutRequestStateEnum.COMPLETED
                             break
                     else:
-                        _req.add_assistant_message(self.tokenizer, content, content_ids)
+                        _req.add_assistant_message(self.tokenizer, content)
                         break
 
         if current_turns >= self.config.multi_turn.max_turns:
@@ -756,7 +751,7 @@ class AsyncSGLangRollout(BaseRollout):
                     max_prompt_len=self.config.prompt_length,
                     max_response_len=self.config.response_length,
                     max_model_len=min(self.config.max_model_len, self.config.prompt_length + self.config.response_length),
-                    tokenization_mode=self.tokenization_mode,
+                    sanity_check_tokenization=self.config.multi_turn.sanity_check_tokenization,
                     tokenizer=self.tokenizer,
                 )
 

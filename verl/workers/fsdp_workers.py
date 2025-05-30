@@ -197,7 +197,8 @@ class ActorRolloutRefWorker(Worker):
 
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
         # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        replace_multiturn_chat_template = self.config.rollout.multi_turn.enable and self.config.rollout.multi_turn.replace_chat_template
+        self.tokenizer = hf_tokenizer(local_path, replace_multiturn_chat_template, trust_remote_code=trust_remote_code)
         self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
 
         torch_dtype = fsdp_config.get("model_dtype", None)
