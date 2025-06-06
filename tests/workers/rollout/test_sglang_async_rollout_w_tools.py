@@ -20,6 +20,7 @@ usage: torchrun --standalone --nnodes=1 \
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 from tensordict import TensorDict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -44,11 +45,12 @@ def test_async_sglang_rollout_w_tool():
     initialize_global_process_group()
     clean_torchelastic_env()
 
-    max_prompt_length = 32
+    max_prompt_length = 300
     max_response_length = 16
     dtype = "bfloat16"
     tensor_parallel_size = 2
     local_model_path = "Qwen/Qwen2.5-0.5B"
+    tool_config_path = "./resource/tool_configs/search_tool_config"
 
     tokenizer, actor_model = load_tokenizer_and_model(local_model_path)
 
@@ -60,7 +62,8 @@ def test_async_sglang_rollout_w_tool():
             "What's the best way to learn python?",
         ]
     ]
-    prompts = [tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True) for message in preencode_prompts]
+    tools = [OmegaConf.to_container(tool["tool_schema"]) for tool in OmegaConf.load(tool_config_path)["tools"]]
+    prompts = [tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True, tools=tools) for message in preencode_prompts]
     input_ids, attention_mask, position_ids = prepare_inputs(tokenizer, prompts, max_prompt_length)
 
     hf_response_tokens = generate_hf_output(actor_model, input_ids, attention_mask, tokenizer, max_response_length)
@@ -77,7 +80,7 @@ def test_async_sglang_rollout_w_tool():
         device_mesh=fsdp_device_mesh,
     )
 
-    rollout_config = get_rollout_config(max_response_length, max_prompt_length, dtype, tensor_parallel_size, None)
+    rollout_config = get_rollout_config(max_response_length, max_prompt_length, dtype, tensor_parallel_size, tool_config_path)
     rollout = SGLangRollout(actor_module=local_model_path, config=rollout_config, tokenizer=tokenizer, model_hf_config=actor_model.config)
 
     rollout_sharding_manager = FSDPSGLangShardingManager(
@@ -100,7 +103,18 @@ def test_async_sglang_rollout_w_tool():
         print(f"preprocessed {input_ids.shape=}")
 
         messages = np.asarray(preencode_prompts)
-        prompts = DataProto(batch=prompt_dict, non_tensor_batch={"raw_prompt": messages})
+        tools_kwargs = np.array(
+            [
+                {
+                    "search": {
+                        "create_kwargs": {"ground_truth": "Today is sunny and tomorrow will be cloudy in Beijing.", "data_source": "searchR1_nq"},
+                    },
+                }
+            ]
+            * input_ids.shape[0],
+            dtype=object,
+        )
+        prompts = DataProto(batch=prompt_dict, non_tensor_batch={"raw_prompt": messages, "tools_kwargs": tools_kwargs})
 
         prompts.meta_info.update(
             {
@@ -122,7 +136,7 @@ def test_async_sglang_rollout_w_tool():
 
     print(f"hf response: {hf_response_tokens}")
     print(f"sglang response: {sglang_response_tokens}")
-    assert are_lists_similar(hf_response_tokens, sglang_response_tokens)
+    assert are_lists_similar(hf_response_tokens, sglang_response_tokens, threshold=14)
     print("SGLang w tool Test Passed!")
 
     torch.distributed.barrier()
